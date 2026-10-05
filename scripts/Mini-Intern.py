@@ -1,39 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-Small Language Model from Scratch - adapted for HuggingFaceTB/cosmopedia
-
-Adapted from a TinyStories/Alpaca-based training script.
-
-# Introduction
+Small Language Model from Scratch - trained on a pickled Cosmopedia subset
 
 We build a Small Language Model (SLM) from scratch, keeping the parameter
 count at roughly 50-60 million.
 
-We train on Cosmopedia, a large synthetic corpus of textbook-style content,
-stories, WikiHow articles, etc. There is no instruction/response structure:
-each example's `text` column is plain prose, so we tokenize it directly and
-append an end-of-text token after every document so the model learns where
-one document ends and the next begins.
+The dataset comes from a pickled DatasetDict (default: ds.pkl, written by
+load_data.py) with "train" and "validation" splits and a "text" column. Each
+document is tokenized with the GPT-2 BPE tokenizer and an end-of-text token is
+appended, so the model learns where one document ends and the next begins.
 
-Install dependencies once in your shell (not inside this file):
-    pip install tiktoken datasets numpy tqdm matplotlib torch
+Usage:
+    python Mini-Intern.py                          # reads ./ds.pkl
+    DATASET_PKL=/path/to/other.pkl python Mini-Intern.py
 
-On a cluster node without internet, pre-download the data from a login node
-(huggingface-cli download HuggingFaceTB/cosmopedia --repo-type dataset
- --include "data/stories/*" ...) and run with HF_DATASETS_OFFLINE=1.
+Note: tiktoken downloads the GPT-2 vocabulary on first use. If your compute
+node has no internet, run `python -c "import tiktoken; tiktoken.get_encoding('gpt2')"`
+once on a login node (same TIKTOKEN_CACHE_DIR / home dir) beforehand.
 
 ## Step 1: Import the Dataset
 """
 
 import os
-from datasets import load_dataset, DatasetDict, concatenate_datasets
+import pickle
+from datasets import DatasetDict
 
-# Cosmopedia subsets (configs) to use. Options: stories, wikihow, openstax,
-# khanacademy, stanford, auto_math_text, web_samples_v1, web_samples_v2.
-CONFIGS = ["stories", "wikihow"]
+# Path to the pickled DatasetDict
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Cap rows per config so tokenization stays manageable. None = use everything.
-MAX_ROWS_PER_CONFIG = 500_000
+PKL_PATH = os.environ.get(f"{BASE_DIR}/data/", "ds.pkl")
 
 # Everything produced by this script (token files, checkpoint, plot) lives here
 # so it can never be confused with files from an earlier Alpaca/TinyStories run.
@@ -47,21 +42,23 @@ LOSS_PLOT_PATH = os.path.join(DATA_DIR, "loss_curve.png")
 # Use the CPUs Slurm gave us, if any
 NUM_PROC = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
 
-# Only build the dataset if we still need to tokenize it
-if not (os.path.exists(TRAIN_BIN) and os.path.exists(VAL_BIN)):
-    parts = []
-    for cfg in CONFIGS:
-        d = load_dataset("HuggingFaceTB/cosmopedia", cfg, split="train")
-        if MAX_ROWS_PER_CONFIG is not None and len(d) > MAX_ROWS_PER_CONFIG:
-            d = d.shuffle(seed=42).select(range(MAX_ROWS_PER_CONFIG))
-        d = d.select_columns(["text"])  # keep only text so configs concatenate cleanly
-        parts.append(d)
+# The pickle is only needed to build the .bin files. If train.bin and
+# validation.bin already exist (from a previous run), we skip loading it.
+NEED_TOKENIZE = not (os.path.exists(TRAIN_BIN) and os.path.exists(VAL_BIN))
 
-    raw_train = concatenate_datasets(parts).shuffle(seed=42)
-
-    # Cosmopedia only has a "train" split, so carve out a small validation set.
-    split = raw_train.train_test_split(test_size=0.01, seed=42)
-    ds = DatasetDict({'train': split['train'], 'validation': split['test']})
+if NEED_TOKENIZE:
+    print(f"Loading dataset from {PKL_PATH} ...")
+    with open(PKL_PATH, "rb") as f:
+        ds = pickle.load(f)
+    for name in ("train", "validation"):
+        assert name in ds, f"pickled DatasetDict has no '{name}' split"
+        assert "text" in ds[name].column_names, f"'{name}' split has no 'text' column"
+    # Keep only the text column so tokenization sees nothing else
+    ds = DatasetDict({k: v.select_columns(["text"]) for k, v in ds.items()})
+    print({k: f"{len(v):,} rows" for k, v in ds.items()})
+else:
+    print(f"{TRAIN_BIN} and {VAL_BIN} found - skipping dataset loading and tokenization. "
+          f"Delete them if you want to rebuild from {PKL_PATH}.")
 
 """## Step 2: Tokenize the Dataset
 
@@ -91,7 +88,7 @@ def process(example):
     out = {'ids': ids, 'len': len(ids)}
     return out
 
-if not (os.path.exists(TRAIN_BIN) and os.path.exists(VAL_BIN)):
+if NEED_TOKENIZE:
     tokenized = ds.map(
         process,
         remove_columns=['text'],
@@ -100,7 +97,7 @@ if not (os.path.exists(TRAIN_BIN) and os.path.exists(VAL_BIN)):
     )
     # concatenate all the ids in each dataset into one large file we can use for training
     for split_name, dset in tokenized.items():
-        arr_len = np.sum(dset['len'], dtype=np.uint64)
+        arr_len = int(np.sum(dset['len'], dtype=np.uint64))
         filename = os.path.join(DATA_DIR, f'{split_name}.bin')
         dtype = np.uint16  # (can do since enc.max_token_value == 50256 is < 2**16)
         arr = np.memmap(filename, dtype=dtype, mode='w+', shape=(arr_len,))
@@ -116,6 +113,7 @@ if not (os.path.exists(TRAIN_BIN) and os.path.exists(VAL_BIN)):
             arr[idx: idx + len(arr_batch)] = arr_batch
             idx += len(arr_batch)
         arr.flush()
+        print(f"{filename}: {arr_len:,} tokens")
 
 """## Step 3: Create Input-Output batches for the dataset"""
 
