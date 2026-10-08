@@ -1,0 +1,8 @@
+{
+  "tokenizer": "cl100k_base",
+  "dtype": "uint32",
+  "n_vocab": 100277,
+  "eot_token": 100257,
+  "train_tokens": 2100437172,
+  "val_tokens": 20959603
+}
